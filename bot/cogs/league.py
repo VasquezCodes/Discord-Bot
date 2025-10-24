@@ -13,8 +13,7 @@ import asyncio
 # --- Configuración ---
 NUM_MATCHUPS_TO_SHOW = 5
 
-# Mantengo el parseo de "lane" para compatibilidad con tu comando,
-# pero LeagueOfGraphs no lo necesita en la URL.
+# La URL de LeagueOfGraphs NO usa rol; conservamos "lane" por compatibilidad del comando.
 DEFAULT_LANE = "mid"
 LANE_MAP = {
     "top": "top", "superior": "top",
@@ -37,30 +36,23 @@ REQUEST_HEADERS = {
     "Pragma": "no-cache",
     "Referer": "https://www.google.com/",
 }
-# --- Fin Configuración ---
-
 
 # --- Utilidades ---
 ROLES_ES = ("Superior", "Jungla", "Central", "Tirador", "Soporte")
 
 def get_safe_champion_name_for_url(champion_name: str) -> str:
-    """
-    Normaliza el nombre al slug que usa League of Graphs.
-    """
+    """Normaliza el nombre al slug que usa League of Graphs."""
     name = champion_name.strip().lower()
     if name in {"jarvan iv", "jarvan 4", "jarvaniv"}: return "jarvaniv"
     if name in {"miss fortune", "missfortune"}: return "missfortune"
     if name in {"dr mundo", "dr. mundo", "doctor mundo", "drmundo"}: return "drmundo"
     if name in {"nunu & willump", "nunu y willump", "nunu-willump"}: return "nunu"
-    # LoG usa "wukong" (no "monkeyking")
-    # quitar apóstrofes, puntos y espacios (kha'zix -> khazix, kai'sa -> kaisa)
-    name = re.sub(r"['.\s]", "", name)
+    # LoG usa "wukong"
+    name = re.sub(r"['.\s]", "", name)  # kha'zix -> khazix, kai'sa -> kaisa
     return name
 
 def strip_trailing_role(label: str) -> str:
-    """
-    Quita el sufijo de rol en español al final del nombre (p.ej. 'Kassadin Central' -> 'Kassadin').
-    """
+    """Quita el sufijo de rol en español al final del nombre (p.ej. 'Briar Jungla' -> 'Briar')."""
     label = label.strip()
     for role in ROLES_ES:
         if label.endswith(" " + role):
@@ -73,24 +65,65 @@ def parse_number(s: str) -> Optional[float]:
     except Exception:
         return None
 
-def choose_wr_candidate(nums: List[float]) -> Optional[float]:
+def pick_wr_from_candidates(nums: List[float]) -> Optional[float]:
     """
-    De varios números encontrados en la fila, elige el más plausible como WR:
-    - Normaliza valores [0,1] -> [0,100]
-    - Filtra a [1, 100]
-    - Devuelve el más cercano a 50
+    Si ya son porcentajes reales (1..100), elige el más cercano a 50.
+    Si hay valores en 0..1, los considera como proporciones y multiplica x100.
+    Filtra a (0.5..100).
     """
     norm = []
     for n in nums:
-        if n <= 1.0:
+        if -1.001 <= n <= 1.001:
             n = n * 100.0
         if 0.5 <= n <= 100.0:
             norm.append(n)
     if not norm:
         return None
     return min(norm, key=lambda x: abs(x - 50.0))
-# --- Fin utilidades ---
 
+def adv_to_wr(adv: float, section_is_win: bool) -> float:
+    """
+    Convierte ventaja (magnitud o valor en [-1,1]) a WR.
+    - Si |adv| <= 1, se interpreta como fracción (e.g., -0.0979 -> -9.79 %)
+    - 'gana más contra' suma; 'pierde más contra' resta.
+    """
+    if -1.001 <= adv <= 1.001:
+        adv_pct = adv * 100.0
+    else:
+        adv_pct = adv
+    return 50.0 + (adv_pct if section_is_win else -adv_pct)
+
+def extract_name_from_tr(tr) -> Optional[str]:
+    """Saca el nombre del campeón rival (preferencia: span.name)."""
+    # 1) span.name (como en tu captura)
+    span = tr.select_one("span.name")
+    if span:
+        t = span.get_text(" ", strip=True)
+        if t:
+            return strip_trailing_role(t)
+
+    # 2) Enlace al campeón
+    a = tr.select_one("td a[href]")
+    if a:
+        t = a.get_text(" ", strip=True)
+        if t:
+            return strip_trailing_role(t)
+
+    # 3) alt de cualquier img
+    for img in tr.find_all("img"):
+        alt = img.get("alt")
+        if alt:
+            alt = strip_trailing_role(alt.strip())
+            if alt:
+                return alt
+
+    # 4) Texto de la fila (último recurso)
+    text = tr.get_text(" ", strip=True)
+    m = re.search(r"([A-Za-zÁÉÍÓÚÜÑ' -]{2,})", text)
+    if m:
+        return strip_trailing_role(m.group(1).strip())
+
+    return None
 
 # --- Scraper League of Graphs ---
 def scrape_leagueofgraphs_matchups(champion_name: str, lane: str) -> Optional[List[Dict]]:
@@ -119,7 +152,7 @@ def scrape_leagueofgraphs_matchups(champion_name: str, lane: str) -> Optional[Li
     resultados: List[Dict] = []
 
     try:
-        # Busca h3 con los títulos de interés y toma la tabla inmediatamente posterior
+        # Busca h3 con “gana más contra” / “pierde más contra” y usa la tabla siguiente
         h3_targets = []
         for h3 in soup.find_all("h3"):
             txt = h3.get_text(" ", strip=True).lower()
@@ -129,64 +162,92 @@ def scrape_leagueofgraphs_matchups(champion_name: str, lane: str) -> Optional[Li
         logging.info(f"[LoL Scraper] h3 targets encontrados: {len(h3_targets)}")
 
         for h3 in h3_targets:
+            titulo = h3.get_text(" ", strip=True).lower()
+            section_is_win = "gana más contra" in titulo
+
             table = h3.find_next("table")
+            if not table:
+                # fallback: buscar dentro del box
+                box = h3.find_parent("div", class_="boxContainer")
+                if box:
+                    table = box.select_one("table.data_table, table.sortable_table, table")
             if not table:
                 logging.warning("[LoL Scraper] No se encontró <table> tras el h3 objetivo.")
                 continue
 
             # Recorremos filas del cuerpo
             for tr in table.select("tbody tr"):
-                # --- Nombre del campeón rival ---
-                nombre: Optional[str] = None
+                nombre = extract_name_from_tr(tr)
 
-                a = tr.select_one("td a[href*='/champions/']")
-                if a:
-                    nombre = strip_trailing_role(a.get_text(" ", strip=True))
-
-                if not nombre:
-                    img = tr.find("img")
-                    if img and img.get("alt"):
-                        nombre = strip_trailing_role(img["alt"].strip())
-
-                # --- Candidatos a WinRate ---
                 wr_candidates: List[float] = []
+                adv_candidates: List[float] = []
 
-                # 1) Cualquier elemento con data-value (progress bar u otro)
-                node = tr.select_one("[data-value]")
-                if node and node.has_attr("data-value"):
-                    v = parse_number(str(node["data-value"]))
-                    if v is not None:
-                        wr_candidates.append(v)
+                # 1) Todos los <progressbar> con data-value (tu captura)
+                for pb in tr.select("progressbar[data-value]"):
+                    v = parse_number(str(pb.get("data-value", "")))
+                    if v is None:
+                        continue
+                    # Heurística: si el progressbar declara rango con negativo, trátalo como ventaja.
+                    minv = parse_number(str(pb.get("data-minvalue", "0")))
+                    maxv = parse_number(str(pb.get("data-maxvalue", "0")))
+                    is_pct_flag = str(pb.get("data-ispercentage", "0")) == "1"
 
-                # 2) Porcentaje en texto dentro de cualquier td
+                    if minv is not None and maxv is not None and (minv < 0 or maxv < 0):
+                        # viene como fracción o magnitud de ventaja
+                        adv_candidates.append(v if abs(v) > 1.001 or not is_pct_flag else v)  # igual lo normalizamos después
+                    else:
+                        # Si es fracción, llevar a %
+                        if -1.001 <= v <= 1.001:
+                            wr_candidates.append(v * 100.0)
+                        else:
+                            wr_candidates.append(v)
+
+                # 2) Porcentaje explícito en texto (por si el sitio lo incluye)
                 for td in tr.find_all("td"):
                     text = td.get_text(" ", strip=True)
-                    m = re.findall(r"(\d+(?:[.,]\d+)?)\s*%", text)
-                    for g in m:
+                    for g in re.findall(r"(-?\d+(?:[.,]\d+)?)\s*%", text):
                         v = parse_number(g)
-                        if v is not None:
+                        if v is None:
+                            continue
+                        # Si es pequeño (<= 30), probablemente sea ventaja mostrada como % (no WR)
+                        if abs(v) <= 30:
+                            adv_candidates.append(v)
+                        else:
                             wr_candidates.append(v)
 
-                # 3) data-sort-value en celdas numéricas
+                # 3) data-sort-value numérico
                 for td in tr.find_all("td"):
                     dsv = td.get("data-sort-value")
-                    if dsv is not None:
-                        v = parse_number(str(dsv))
-                        if v is not None:
-                            wr_candidates.append(v)
+                    if dsv is None:
+                        continue
+                    v = parse_number(str(dsv))
+                    if v is None:
+                        continue
+                    if -1.001 <= v <= 1.001:
+                        wr_candidates.append(v * 100.0)
+                    elif abs(v) <= 30:
+                        adv_candidates.append(v)
+                    else:
+                        wr_candidates.append(v)
 
-                wr = choose_wr_candidate(wr_candidates)
+                # Elegimos WR:
+                wr = pick_wr_from_candidates(wr_candidates)
+
+                # Si no hay WR pero sí ventaja, conviértela:
+                if wr is None and adv_candidates:
+                    # Toma la de mayor magnitud (más informativa)
+                    adv = max(adv_candidates, key=lambda x: abs(x))
+                    # Si era fracción, multiplicaremos dentro de adv_to_wr
+                    wr = adv_to_wr(adv, section_is_win)
 
                 if nombre and (wr is not None):
                     resultados.append({"champion": nombre, "win_rate_float": wr})
                 else:
-                    # Log de diagnóstico por fila
-                    if nombre and not wr_candidates:
-                        logging.debug(f"[LoL Scraper] Sin WR en fila para {nombre}")
-                    elif nombre:
-                        logging.debug(f"[LoL Scraper] WR candidatos {wr_candidates} -> elegido {wr} para {nombre}")
+                    # Logs de diagnóstico por fila
+                    if nombre:
+                        logging.debug(f"[LoL Scraper] {nombre} — wr_cand={wr_candidates} adv_cand={adv_candidates} -> wr={wr}")
                     else:
-                        logging.debug(f"[LoL Scraper] Fila sin nombre utilizable: {tr.get_text(' ', strip=True)[:120]}")
+                        logging.debug(f"[LoL Scraper] Fila sin nombre. wr_cand={wr_candidates} adv_cand={adv_candidates}")
 
     except Exception:
         logging.exception("[LoL Scraper] Error al parsear HTML de LeagueOfGraphs.")
@@ -199,7 +260,6 @@ def scrape_leagueofgraphs_matchups(champion_name: str, lane: str) -> Optional[Li
     logging.info(f"[LoL Scraper] Extraídos {len(resultados)} matchups.")
     return resultados
 
-
 # --- Cog de Discord ---
 class LeagueCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -210,7 +270,7 @@ class LeagueCog(commands.Cog):
     async def get_matchups(self, ctx: commands.Context, *, query: str):
         """
         Muestra los mejores y peores matchups para un campeón.
-        Uso: .matchups <campeon> [linea]  (ej: .matchups Kai'Sa adc)
+        Uso: .matchups <campeon> [linea]  (ej: .matchups Zed mid)
         * La línea hoy no afecta la URL de LeagueOfGraphs, se mantiene por compatibilidad.
         """
         query = query.strip()
@@ -276,7 +336,7 @@ class LeagueCog(commands.Cog):
             )
 
             peores_lines = [
-                f"**{i+1}. vs {m.get('champion','???')}** — WR: **{m.get('win_rate_float',100.0)::.2f}%** 👎"
+                f"**{i+1}. vs {m.get('champion','???')}** — WR: **{m.get('win_rate_float',100.0):.2f}%** 👎"
                 for i, m in enumerate(peores)
             ]
             embed.add_field(
@@ -301,7 +361,6 @@ class LeagueCog(commands.Cog):
         else:
             logging.error(f"Error inesperado en comando .matchups: {error}")
             await ctx.send("❌ Ocurrió un error inesperado.")
-
 
 # --- Setup del COG ---
 async def setup(bot: commands.Bot) -> None:
