@@ -1,20 +1,24 @@
 # Discord Bot Core
-discord.py[voice]==2.4.0
+discord.py==2.6.4
 python-dotenv==1.0.1
 
 # Audio Processing
 wavelink==3.4.1
-PyNaCl==1.5.0
-yt-dlp==2024.8.6
+PyNaCl==1.6.0
+yt-dlp==2025.10.18.232824.dev0
+audioop-lts==0.2.2
 
 # Spotify Integration
-spotipy==2.24.0
+spotipy==2.25.1
 
 # Web Scraping (League of Legends Cog)
-requests>=2.32.2
-beautifulsoup4==4.12.3
-lxml==5.1.0
+requests==2.32.5
+beautifulsoup4==4.14.2
+lxml==6.0.2
 
 # HTTP Client
-aiohttp==3.9.5
+aiohttp==3.13.1
 flask
+
+# Additional dependencies (auto-installed but listed for completeness)
+websockets==15.0.1

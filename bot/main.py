@@ -5,6 +5,11 @@ import logging
 import os
 import aiohttp
 
+# --- Parche para Python 3.13: audioop fue removido de stdlib ---
+import audioop_lts as audioop
+import sys
+sys.modules['audioop'] = audioop
+
 # --- Mantener Flask al inicio (para levantar servidor web en Render) ---
 from flask import Flask
 import threading
