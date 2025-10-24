@@ -5,8 +5,8 @@ python-dotenv==1.0.1
 # Audio Processing
 wavelink==3.4.1
 PyNaCl==1.6.0
-yt-dlp==2025.10.18.232824.dev0
-audioop-lts==0.2.2
+yt-dlp==2024.8.6
+# audioop-lts==0.2.2  # Requiere Python 3.13+, no compatible con 3.11.9
 
 # Spotify Integration
 spotipy==2.25.1

@@ -6,9 +6,18 @@ import os
 import aiohttp
 
 # --- Parche para Python 3.13: audioop fue removido de stdlib ---
-import audioop_lts as audioop
+# En Python 3.11.9, audioop está disponible nativamente
 import sys
-sys.modules['audioop'] = audioop
+try:
+    import audioop
+except ImportError:
+    # Solo si estamos en Python 3.13+, intentar usar audioop_lts
+    try:
+        import audioop_lts as audioop
+        sys.modules['audioop'] = audioop
+    except ImportError:
+        logging.warning("⚠️ audioop no disponible. Algunas funciones de audio pueden no funcionar.")
+        audioop = None
 
 # --- Mantener Flask al inicio (para levantar servidor web en Render) ---
 from flask import Flask
