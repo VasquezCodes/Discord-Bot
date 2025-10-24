@@ -11,7 +11,7 @@ yt-dlp==2024.8.6
 spotipy==2.24.0
 
 # Web Scraping (League of Legends Cog)
-requests==2.31.0
+requests>=2.32.2
 beautifulsoup4==4.12.3
 lxml==5.1.0
 
