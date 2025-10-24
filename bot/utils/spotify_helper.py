@@ -1,4 +1,4 @@
-# --- bot/utils/spotify_helper.py (Radio Vecinos + Fallback Playlist Año + Logs) ---
+# --- bot/utils/spotify_helper.py (Radio Vecinos + Fallback Playlist Año | Logs + Fix 403 AF) ---
 
 import asyncio
 import logging
@@ -27,6 +27,7 @@ except ImportError:
         spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID")
         spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         spotify_market = os.getenv("SPOTIFY_MARKET")
+        spotify_disable_audio_features = os.getenv("SPOTIFY_DISABLE_AUDIO_FEATURES")
     def get_settings(): return MockSettings()
     logging.warning("No se encontró config.settings, usando os.getenv para Spotify.")
 
@@ -116,6 +117,14 @@ def _get_market_default() -> str:
     except Exception:
         return os.getenv("SPOTIFY_MARKET", "AR").upper()
 
+def _audio_features_desactivadas() -> bool:
+    try:
+        settings = get_settings()
+        v = getattr(settings, "spotify_disable_audio_features", None) or os.getenv("SPOTIFY_DISABLE_AUDIO_FEATURES")
+        return str(v).lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
 # =========================
 # NUEVO: Radio por Vecinos
 # =========================
@@ -153,17 +162,81 @@ def _distancia_audio(a: Dict[str, float], b: Dict[str, float]) -> float:
 
 def _fmt_vec_corto(vec: Optional[Dict[str, float]]) -> str:
     if not vec: return "sin_features"
-    # resumen corto para logs
     keys = ("danceability","energy","valence","tempo")
     parts = []
     for k in keys:
         v = vec.get(k, 0.0)
         if k == "tempo":
-            # re-escala aproximada a BPM para el log
             parts.append(f"{k[:3]}={int(round(v*250))}bpm")
         else:
             parts.append(f"{k[:3]}={v:.2f}")
     return ",".join(parts)
+
+# --- Helpers robustos para audio-features (manejo 403 y fallback single) ---
+def _get_seed_features_seguro(client: Spotify, seed_id: str) -> Optional[Dict[str, float]]:
+    if _audio_features_desactivadas():
+        logging.info("Radio Vecinos: ⛔ audio-features desactivadas por configuración (SPOTIFY_DISABLE_AUDIO_FEATURES).")
+        return None
+    try:
+        # Intento batch normal
+        af_list = client.audio_features([seed_id]) or []
+        af = af_list[0] if af_list else None
+        vec = _vector_audio_features(af) if af else None
+        if vec: return vec
+        logging.warning("Radio Vecinos: seed sin vector de features (None).")
+    except SpotifyException as e:
+        if getattr(e, "http_status", None) == 403:
+            logging.warning("Radio Vecinos: 403 en audio-features (seed). Reintentando endpoint single…")
+            try:
+                # Forzar endpoint single
+                af_single = client._get(f"audio-features/{seed_id}")
+                vec = _vector_audio_features(af_single)
+                if vec:
+                    return vec
+                logging.warning("Radio Vecinos: endpoint single devolvió features vacíos/None para seed.")
+            except Exception as e2:
+                logging.info(f"Radio Vecinos: fallo single seed AF: {e2}. Continuamos sin features.")
+        else:
+            logging.info(f"Radio Vecinos: fallo audio-features seed ({e}). Continuamos sin features.")
+    except Exception as ex:
+        logging.info(f"Radio Vecinos: excepción inesperada en seed AF: {ex}. Continuamos sin features.")
+    return None
+
+def _get_batch_features_seguro(client: Spotify, ids: List[str]) -> Dict[str, Dict[str, float]]:
+    id2vec: Dict[str, Dict[str, float]] = {}
+    if not ids or _audio_features_desactivadas():
+        return id2vec
+    # Particionar en chunks de 100 (límite API)
+    def _chunks(lst, n): 
+        for i in range(0, len(lst), n): 
+            yield lst[i:i+n]
+    for chunk in _chunks(ids, 100):
+        try:
+            feats = client.audio_features(chunk) or []
+            for af in feats:
+                if not af or not af.get("id"): 
+                    continue
+                vec = _vector_audio_features(af)
+                if vec:
+                    id2vec[af["id"]] = vec
+        except SpotifyException as e:
+            if getattr(e, "http_status", None) == 403:
+                logging.warning("Radio Vecinos: 403 en audio-features batch. Reintentando por cada id (single)…")
+                # Intentar uno por uno para este chunk
+                for tid in chunk:
+                    try:
+                        af_single = client._get(f"audio-features/{tid}")
+                        vec = _vector_audio_features(af_single)
+                        if vec:
+                            id2vec[tid] = vec
+                    except Exception as e2:
+                        logging.debug(f"Radio Vecinos: single AF falló para {tid}: {e2}")
+                # seguimos con el resto de chunks
+            else:
+                logging.info(f"Radio Vecinos: fallo batch AF ({e}). Seguimos sin features para este chunk.")
+        except Exception as ex:
+            logging.info(f"Radio Vecinos: excepción batch AF ({ex}). Seguimos sin features para este chunk.")
+    return id2vec
 
 def _fetch_radio_vecinos_sync(
     original_title: str,
@@ -177,11 +250,11 @@ def _fetch_radio_vecinos_sync(
     """
     Estrategia sin /recommendations:
       1) Buscar track semilla (search track)
-      2) audio_features(seed)
+      2) audio_features(seed) (tolerante a 403)
       3) related_artists(seed.artist)
       4) artist_top_tracks(related_i, market)
-      5) audio_features(batch de candidatos)
-      6) Rank por distancia de audio y filtrar duplicados/historial
+      5) audio_features(batch candidatos) (tolerante a 403)
+      6) Rank por distancia (si hay features) o por popularidad (fallback)
     """
     t0 = perf_counter()
     client = _ensure_spotify_client()
@@ -215,11 +288,9 @@ def _fetch_radio_vecinos_sync(
         seed_artista_nombre = seed_artistas[0].get("name", "?")
         logging.info(f"Radio Vecinos: 🎯 seed='{seed_artista_nombre} - {seed_name}' (id={seed_id}) t={perf_counter()-t_seed:.3f}s")
 
-        # 2) Audio features de la semilla
+        # 2) Audio features de la semilla (robusto)
         t_feat_seed = perf_counter()
-        af_seed_list = client.audio_features([seed_id]) or []
-        af_seed = af_seed_list[0] if af_seed_list else None
-        vec_seed = _vector_audio_features(af_seed) if af_seed else None
+        vec_seed = _get_seed_features_seguro(client, seed_id)
         logging.info(f"Radio Vecinos: 🎛️ features_seed={_fmt_vec_corto(vec_seed)} t={perf_counter()-t_feat_seed:.3f}s")
 
         # 3) Artistas relacionados
@@ -268,22 +339,12 @@ def _fetch_radio_vecinos_sync(
             logging.warning("Radio Vecinos: ❗ no hay candidatos")
             return None
 
-        # 5) Audio features batch para candidatos
+        # 5) Audio features batch para candidatos (robusto)
         t_feat_batch = perf_counter()
         ids = [t["id"] for t in candidatos_tracks if t.get("id")]
-        feats = client.audio_features(ids) if ids else []
-        id2vec: Dict[str, Dict[str, float]] = {}
-        sin_vec = 0
-        for af in feats or []:
-            if not af or not af.get("id"): 
-                continue
-            vec = _vector_audio_features(af)
-            if vec:
-                id2vec[af["id"]] = vec
-            else:
-                sin_vec += 1
+        id2vec = _get_batch_features_seguro(client, ids)
         logging.info(
-            f"Radio Vecinos: 🧪 features_batch={len(id2vec)}/{len(ids)} sin_vec={sin_vec} "
+            f"Radio Vecinos: 🧪 features_batch={len(id2vec)}/{len(ids)} "
             f"t={perf_counter()-t_feat_batch:.3f}s"
         )
 
@@ -296,11 +357,11 @@ def _fetch_radio_vecinos_sync(
             if vec_seed and tid in id2vec:
                 dist = _distancia_audio(vec_seed, id2vec[tid])
             else:
-                dist = 9.99 - float(t.get("popularity", 0)) / 100.0  # fallback simple (menor es mejor)
+                # Fallback: priorizar popularidad (menor distancia = mejor)
+                dist = 9.99 - float(t.get("popularity", 0)) / 100.0
             scored.append((dist, t))
         scored.sort(key=lambda x: x[0])
 
-        # Loguear las 5 mejores distancias para diagnóstico
         muestra = ", ".join([f"{(s[1].get('name','?'))}:{s[0]:.2f}" for s in scored[:5]])
         logging.debug(f"Radio Vecinos: 🧭 top5_distancias=[{muestra}] t={perf_counter()-t_rank:.3f}s")
 
@@ -510,7 +571,7 @@ async def fetch_spotify_recommendation(
     history_key = tuple(sorted(list(session_played_tuples)))
     logging.info(f"Radio Engine: 🎚️ Estrategia=Vecinos→Fallback seed='{original_title}' historial={len(history_key)}")
     try:
-        # 1) Intento principal: Vecinos por artista + audio-features
+        # 1) Intento principal: Vecinos por artista + audio-features (tolerante a 403)
         vecinos = await loop.run_in_executor(None, lambda: _fetch_radio_vecinos_sync(original_title, history_key))
         if vecinos:
             logging.info(f"Radio Engine: ✅ Vecinos produjo {len(vecinos)} temas")
