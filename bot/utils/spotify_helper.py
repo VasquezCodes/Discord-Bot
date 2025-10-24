@@ -1,12 +1,13 @@
-# --- bot/utils/spotify_helper.py (Radio Vecinos + Fallback Playlist Año | Logs + Fix 403 AF) ---
+# --- bot/utils/spotify_helper.py (Radio Co-ocurrencia + Feats → Fallback por Playlist | SIN endpoints deprecated) ---
 
 import asyncio
 import logging
+import math
+import os
 import random
 import re
-import os
 from time import perf_counter
-from typing import List, Optional, Set, Tuple, Dict
+from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime
 
 # --- Imports y Configuración Inicial ---
@@ -27,7 +28,6 @@ except ImportError:
         spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID")
         spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         spotify_market = os.getenv("SPOTIFY_MARKET")
-        spotify_disable_audio_features = os.getenv("SPOTIFY_DISABLE_AUDIO_FEATURES")
     def get_settings(): return MockSettings()
     logging.warning("No se encontró config.settings, usando os.getenv para Spotify.")
 
@@ -117,263 +117,310 @@ def _get_market_default() -> str:
     except Exception:
         return os.getenv("SPOTIFY_MARKET", "AR").upper()
 
-def _audio_features_desactivadas() -> bool:
+# ==============================
+# Utilidades de scoring y logs
+# ==============================
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(map(str.lower, a or [])), set(map(str.lower, b or []))
+    if not sa or not sb: return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+def _safe_year_from_release_date(date_str: Optional[str]) -> Optional[int]:
+    # release_date puede venir como 'YYYY', 'YYYY-MM', 'YYYY-MM-DD'
+    if not date_str: return None
     try:
-        settings = get_settings()
-        v = getattr(settings, "spotify_disable_audio_features", None) or os.getenv("SPOTIFY_DISABLE_AUDIO_FEATURES")
-        return str(v).lower() in ("1", "true", "yes", "on")
+        return int(date_str.split("-")[0])
     except Exception:
-        return False
-
-# =========================
-# NUEVO: Radio por Vecinos
-# =========================
-_FEATURE_KEYS = ["danceability","energy","speechiness","acousticness","instrumentalness","liveness","valence","tempo"]
-_WEIGHTS = {
-    "danceability": 1.0,
-    "energy": 1.0,
-    "valence": 0.9,
-    "tempo": 0.6,
-    "speechiness": 0.3,
-    "acousticness": 0.5,
-    "instrumentalness": 0.4,
-    "liveness": 0.3,
-}
-
-def _vector_audio_features(af: dict) -> Optional[Dict[str, float]]:
-    if not isinstance(af, dict): return None
-    vec: Dict[str, float] = {}
-    for k in _FEATURE_KEYS:
-        v = af.get(k)
-        if v is None: return None
-        if k == "tempo":
-            v = max(0.0, min(1.0, float(v) / 250.0))  # normalizar BPM a [0..1]
-        else:
-            v = float(v)
-        vec[k] = v
-    return vec
-
-def _distancia_audio(a: Dict[str, float], b: Dict[str, float]) -> float:
-    d = 0.0
-    for k in _FEATURE_KEYS:
-        w = _WEIGHTS.get(k, 0.5)
-        d += w * abs(a[k] - b[k])
-    return d
-
-def _fmt_vec_corto(vec: Optional[Dict[str, float]]) -> str:
-    if not vec: return "sin_features"
-    keys = ("danceability","energy","valence","tempo")
-    parts = []
-    for k in keys:
-        v = vec.get(k, 0.0)
-        if k == "tempo":
-            parts.append(f"{k[:3]}={int(round(v*250))}bpm")
-        else:
-            parts.append(f"{k[:3]}={v:.2f}")
-    return ",".join(parts)
-
-# --- Helpers robustos para audio-features (manejo 403 y fallback single) ---
-def _get_seed_features_seguro(client: Spotify, seed_id: str) -> Optional[Dict[str, float]]:
-    if _audio_features_desactivadas():
-        logging.info("Radio Vecinos: ⛔ audio-features desactivadas por configuración (SPOTIFY_DISABLE_AUDIO_FEATURES).")
         return None
-    try:
-        # Intento batch normal
-        af_list = client.audio_features([seed_id]) or []
-        af = af_list[0] if af_list else None
-        vec = _vector_audio_features(af) if af else None
-        if vec: return vec
-        logging.warning("Radio Vecinos: seed sin vector de features (None).")
-    except SpotifyException as e:
-        if getattr(e, "http_status", None) == 403:
-            logging.warning("Radio Vecinos: 403 en audio-features (seed). Reintentando endpoint single…")
-            try:
-                # Forzar endpoint single
-                af_single = client._get(f"audio-features/{seed_id}")
-                vec = _vector_audio_features(af_single)
-                if vec:
-                    return vec
-                logging.warning("Radio Vecinos: endpoint single devolvió features vacíos/None para seed.")
-            except Exception as e2:
-                logging.info(f"Radio Vecinos: fallo single seed AF: {e2}. Continuamos sin features.")
-        else:
-            logging.info(f"Radio Vecinos: fallo audio-features seed ({e}). Continuamos sin features.")
-    except Exception as ex:
-        logging.info(f"Radio Vecinos: excepción inesperada en seed AF: {ex}. Continuamos sin features.")
-    return None
 
-def _get_batch_features_seguro(client: Spotify, ids: List[str]) -> Dict[str, Dict[str, float]]:
-    id2vec: Dict[str, Dict[str, float]] = {}
-    if not ids or _audio_features_desactivadas():
-        return id2vec
-    # Particionar en chunks de 100 (límite API)
-    def _chunks(lst, n): 
-        for i in range(0, len(lst), n): 
-            yield lst[i:i+n]
-    for chunk in _chunks(ids, 100):
-        try:
-            feats = client.audio_features(chunk) or []
-            for af in feats:
-                if not af or not af.get("id"): 
-                    continue
-                vec = _vector_audio_features(af)
-                if vec:
-                    id2vec[af["id"]] = vec
-        except SpotifyException as e:
-            if getattr(e, "http_status", None) == 403:
-                logging.warning("Radio Vecinos: 403 en audio-features batch. Reintentando por cada id (single)…")
-                # Intentar uno por uno para este chunk
-                for tid in chunk:
-                    try:
-                        af_single = client._get(f"audio-features/{tid}")
-                        vec = _vector_audio_features(af_single)
-                        if vec:
-                            id2vec[tid] = vec
-                    except Exception as e2:
-                        logging.debug(f"Radio Vecinos: single AF falló para {tid}: {e2}")
-                # seguimos con el resto de chunks
-            else:
-                logging.info(f"Radio Vecinos: fallo batch AF ({e}). Seguimos sin features para este chunk.")
-        except Exception as ex:
-            logging.info(f"Radio Vecinos: excepción batch AF ({ex}). Seguimos sin features para este chunk.")
-    return id2vec
-
-def _fetch_radio_vecinos_sync(
+# ============================================================
+# NUEVO: Radio por "co-ocurrencia en playlists" + "feats"
+# (NO usa: related-artists, audio-features, audio-analysis)
+# Endpoints usados: search, artists, artists?ids=, artist_top_tracks,
+#                   playlists/{id}, playlist_items, albums (opcional)
+# ============================================================
+def _fetch_radio_cooc_sync(
     original_title: str,
     session_played_tuples_key: Tuple[Tuple[str, str], ...],
     mercado: Optional[str] = None,
-    max_artistas_rel: int = 8,
-    top_tracks_por_artista: int = 5,
-    max_candidatos: int = 60,
     devolver: int = 5,
+    max_playlists: int = 12,
+    tracks_por_playlist: int = 100,
+    max_coartists: int = 10,
 ) -> Optional[List[Tuple[str, str, str, str, Optional[str], Optional[str]]]]:
+
     """
-    Estrategia sin /recommendations:
-      1) Buscar track semilla (search track)
-      2) audio_features(seed) (tolerante a 403)
-      3) related_artists(seed.artist)
-      4) artist_top_tracks(related_i, market)
-      5) audio_features(batch candidatos) (tolerante a 403)
-      6) Rank por distancia (si hay features) o por popularidad (fallback)
+    Pipeline:
+      1) Resolver semilla (search → track + artist; artist → géneros)
+      2) Buscar playlists por nombre de artista (co-ocurrencia)
+         - Pesar tracks por log1p(followers) de la playlist
+      3) Extraer co-artistas (feats) desde top-tracks del artista semilla
+         - Agregar sus top-tracks al pool con bonus
+      4) Enriquecer artistas candidatos (artists?ids=) → géneros/popularidad
+      5) Scoring con señales: co-ocurrencia, jaccard géneros, popularidad, recencia
+      6) Ordenar, filtrar duplicados/historial y devolver top N
     """
     t0 = perf_counter()
     client = _ensure_spotify_client()
     if client is None:
-        logging.warning("Radio Vecinos: ❌ Cliente Spotify no disponible.")
+        logging.warning("Radio Cooc: ❌ Cliente Spotify no disponible.")
         return None
 
     mercado = (mercado or _get_market_default()).upper()
     sesion_clean = {item[1].lower() for item in session_played_tuples_key if len(item) > 1 and item[1]}
-    logging.info(f"Radio Vecinos: ▶️ start title='{original_title}' market={mercado} historial={len(sesion_clean)}")
+    logging.info(f"Radio Cooc: ▶️ start title='{original_title}' market={mercado} historial={len(sesion_clean)}")
 
     try:
-        # 1) Resolver semilla
+        # 1) Semilla
         t_seed = perf_counter()
         titulo_busqueda = clean_title(original_title, False)
         artista_extraido = extract_artist_from_title(original_title)
         q = f"{artista_extraido} {titulo_busqueda}".strip() if artista_extraido else titulo_busqueda
         r = client.search(q=q, type="track", limit=1)
-        item_track = (r.get("tracks") or {}).get("items", [])
-        if not item_track:
-            logging.warning(f"Radio Vecinos: 🔎 sin track para q='{q}'")
+        items = (r.get("tracks") or {}).get("items", [])
+        if not items:
+            logging.warning(f"Radio Cooc: 🔎 sin track para q='{q}'")
             return None
-        seed_track = item_track[0]
+        seed_track = items[0]
         seed_id = seed_track.get("id")
         seed_name = seed_track.get("name", "?")
-        seed_artistas = seed_track.get("artists") or []
-        if not seed_id or not seed_artistas:
-            logging.warning("Radio Vecinos: seed sin id/artistas")
+        seed_artists = seed_track.get("artists") or []
+        if not seed_id or not seed_artists:
+            logging.warning("Radio Cooc: seed sin id/artistas")
             return None
-        seed_artista_id = seed_artistas[0].get("id")
-        seed_artista_nombre = seed_artistas[0].get("name", "?")
-        logging.info(f"Radio Vecinos: 🎯 seed='{seed_artista_nombre} - {seed_name}' (id={seed_id}) t={perf_counter()-t_seed:.3f}s")
+        seed_artist_id = seed_artists[0].get("id")
+        seed_artist_name = seed_artists[0].get("name", "?")
+        seed_artist = client.artist(seed_artist_id)
+        seed_genres = seed_artist.get("genres") or []
+        seed_year = _safe_year_from_release_date(((seed_track.get("album") or {}).get("release_date")))
+        logging.info(f"Radio Cooc: 🎯 seed='{seed_artist_name} - {seed_name}' (id={seed_id}) genres={seed_genres} t={perf_counter()-t_seed:.3f}s")
 
-        # 2) Audio features de la semilla (robusto)
-        t_feat_seed = perf_counter()
-        vec_seed = _get_seed_features_seguro(client, seed_id)
-        logging.info(f"Radio Vecinos: 🎛️ features_seed={_fmt_vec_corto(vec_seed)} t={perf_counter()-t_feat_seed:.3f}s")
+        # 2) Co-ocurrencia en playlists
+        t_pls = perf_counter()
+        consulta_pls = [
+            f'"{seed_artist_name}"',           # comillas exactas
+            seed_artist_name,                  # sin comillas
+        ]
+        # opcional: por nombre de tema
+        if seed_name:
+            consulta_pls.append(f'"{seed_name}"')
 
-        # 3) Artistas relacionados
-        t_rel = perf_counter()
-        rel = client.artist_related_artists(seed_artista_id)
-        artistas_rel = (rel or {}).get("artists", [])
-        if not artistas_rel:
-            logging.warning(f"Radio Vecinos: 👥 sin relacionados para '{seed_artista_nombre}'")
-            return None
-        artistas_rel = artistas_rel[:max_artistas_rel]
-        nombres_rel = ", ".join([a.get("name","?") for a in artistas_rel])
-        logging.info(f"Radio Vecinos: 👥 relacionados={len(artistas_rel)} [{nombres_rel}] t={perf_counter()-t_rel:.3f}s")
+        playlist_ids_vistos: Set[str] = set()
+        pool: Dict[str, Dict] = {}  # track_id -> data
 
-        # 4) Candidatos: top tracks de cada artista relacionado
-        t_cands = perf_counter()
-        candidatos_tracks: List[Dict] = []
-        total_top_tracks_llamadas = 0
-        for a in artistas_rel:
-            aid = a.get("id")
-            aname = a.get("name", "?")
-            if not aid: continue
+        def _agregar_track_al_pool(t: Dict, peso: float):
+            if not t or not t.get("id"): return
+            if t.get("is_local"): return
+            tid = t["id"]
+            title = t.get("name") or ""
+            main_artist = (t.get("artists") or [{}])[0]
+            aid = main_artist.get("id")
+            aname = main_artist.get("name", "")
+            cleaned = clean_title(title, False).lower().strip()
+            if not cleaned: return
+            if aid == seed_artist_id:  # evitar mismo artista que la semilla para mayor diversidad
+                return
+            if cleaned in sesion_clean:
+                return
+            data = pool.get(tid)
+            if not data:
+                pool[tid] = {
+                    "track": t,
+                    "cooc": float(peso),
+                    "bonus": 0.0,
+                }
+            else:
+                data["cooc"] += float(peso)
+
+        total_pls = 0
+        total_tracks_sumados = 0
+
+        for query in consulta_pls:
             try:
-                tt = client.artist_top_tracks(aid, market=mercado)
-                tracks = (tt or {}).get("tracks", [])[:top_tracks_por_artista]
-                total_top_tracks_llamadas += 1
-                logging.debug(f"Radio Vecinos: ↪︎ top_tracks '{aname}' -> {len(tracks)}")
-                for t in tracks:
-                    if not t or not t.get("id") or not t.get("name"): continue
-                    titulo = t.get("name", "")
-                    cleaned = clean_title(titulo, False).lower().strip()
-                    if cleaned and cleaned not in sesion_clean:
-                        candidatos_tracks.append(t)
-                        if len(candidatos_tracks) >= max_candidatos:
-                            break
-                if len(candidatos_tracks) >= max_candidatos:
-                    break
+                sr = client.search(q=query, type="playlist", limit=max_playlists)
             except SpotifyException as e:
-                logging.info(f"Radio Vecinos: ⚠️ fallo top_tracks artista {aid}: {e}")
+                logging.info(f"Radio Cooc: fallo search playlists q='{query}': {e}")
+                continue
+            pls = (sr.get("playlists") or {}).get("items", []) or []
+            for p in pls:
+                pid = p.get("id")
+                if not pid or pid in playlist_ids_vistos:
+                    continue
+                playlist_ids_vistos.add(pid)
+                try:
+                    pmeta = client.playlist(pid, fields="followers.total,name")
+                    followers = ((pmeta.get("followers") or {}).get("total") or 0)
+                    weight = (math.log1p(followers) / 10.0) + 1.0  # al menos 1
+                except SpotifyException:
+                    weight = 1.0
+
+                # paginar ítems (hasta tracks_por_playlist)
+                offset = 0
+                recogidos = 0
+                while recogidos < tracks_por_playlist:
+                    try:
+                        page = client.playlist_items(
+                            pid,
+                            fields="items(track(id,name,popularity,is_local,artists(id,name),album(id,images,release_date)))",
+                            limit=min(100, tracks_por_playlist - recogidos),
+                            offset=offset
+                        )
+                    except SpotifyException as e:
+                        logging.debug(f"Radio Cooc: fallo playlist_items {pid}: {e}")
+                        break
+                    items_page = (page or {}).get("items", []) or []
+                    if not items_page:
+                        break
+                    for it in items_page:
+                        tr = it.get("track") or {}
+                        _agregar_track_al_pool(tr, peso=weight)
+                        total_tracks_sumados += 1
+                    recogidos += len(items_page)
+                    offset += len(items_page)
+
+                total_pls += 1
+
+        logging.info(f"Radio Cooc: 📚 playlists_escaneadas={total_pls} candidatos_pre_bonus={len(pool)} tracks_sumados={total_tracks_sumados} t={perf_counter()-t_pls:.3f}s")
+        if not pool:
+            logging.warning("Radio Cooc: ❗ sin candidatos por co-ocurrencia")
+            # seguimos a feats igualmente
+
+        # 3) Vecindad por colaboraciones (feats) usando top-tracks
+        t_feats = perf_counter()
+        coartists: Set[str] = set()
+        try:
+            tops = client.artist_top_tracks(seed_artist_id, market=mercado).get("tracks", []) or []
+            for t in tops:
+                for a in t.get("artists", []) or []:
+                    aid = a.get("id")
+                    if aid and aid != seed_artist_id:
+                        coartists.add(aid)
+        except SpotifyException as e:
+            logging.debug(f"Radio Cooc: fallo artist_top_tracks seed: {e}")
+
+        FEAT_BONUS = 0.6  # bonus por provenir de co-artista
+        coartists = set(list(coartists)[:max_coartists])
+
+        co_tracks_added = 0
+        for aid in coartists:
+            try:
+                tt = client.artist_top_tracks(aid, market=mercado).get("tracks", []) or []
+                for t in tt:
+                    _agregar_track_al_pool(t, peso=FEAT_BONUS)
+                    # además suma explícitamente bonus
+                    if t and t.get("id") in pool:
+                        pool[t["id"]]["bonus"] += FEAT_BONUS
+                        co_tracks_added += 1
+            except SpotifyException:
                 continue
 
-        logging.info(
-            f"Radio Vecinos: 📦 candidatos_pre_features={len(candidatos_tracks)} "
-            f"(llamadas_top_tracks={total_top_tracks_llamadas}) t={perf_counter()-t_cands:.3f}s"
-        )
-        if not candidatos_tracks:
-            logging.warning("Radio Vecinos: ❗ no hay candidatos")
+        logging.info(f"Radio Cooc: 🤝 coartists={len(coartists)} tracks_from_feats={co_tracks_added} pool_total={len(pool)} t={perf_counter()-t_feats:.3f}s")
+        if not pool:
+            logging.warning("Radio Cooc: ❗ sin candidatos tras co-ocurrencia+feats")
             return None
 
-        # 5) Audio features batch para candidatos (robusto)
-        t_feat_batch = perf_counter()
-        ids = [t["id"] for t in candidatos_tracks if t.get("id")]
-        id2vec = _get_batch_features_seguro(client, ids)
-        logging.info(
-            f"Radio Vecinos: 🧪 features_batch={len(id2vec)}/{len(ids)} "
-            f"t={perf_counter()-t_feat_batch:.3f}s"
-        )
+        # 4) Enriquecer artistas candidatos (géneros/popularidad)
+        t_enrich = perf_counter()
+        cand_artist_ids: List[str] = []
+        for data in pool.values():
+            tr = data["track"]
+            aid = (tr.get("artists") or [{}])[0].get("id")
+            if aid:
+                cand_artist_ids.append(aid)
+        cand_artist_ids = list({x for x in cand_artist_ids if x})
+        id2genres: Dict[str, List[str]] = {}
+        id2artistpop: Dict[str, int] = {}
+        # batch de a 50
+        for i in range(0, len(cand_artist_ids), 50):
+            chunk = cand_artist_ids[i:i+50]
+            try:
+                arts = client.artists(chunk).get("artists", []) or []
+                for a in arts:
+                    if not a: continue
+                    aid = a.get("id")
+                    if not aid: continue
+                    id2genres[aid] = a.get("genres", []) or []
+                    id2artistpop[aid] = int(a.get("popularity", 0) or 0)
+            except SpotifyException as e:
+                logging.debug(f"Radio Cooc: fallo artists batch: {e}")
+                continue
+        logging.info(f"Radio Cooc: 🧩 enriquecidos artists={len(id2genres)} t={perf_counter()-t_enrich:.3f}s")
 
-        # 6) Rank y selección
-        t_rank = perf_counter()
+        # 5) Scoring
+        # Normalización de co-ocurrencia
+        coocs = [d["cooc"] + d["bonus"] for d in pool.values()]
+        c_min = min(coocs) if coocs else 0.0
+        c_max = max(coocs) if coocs else 1.0
+        c_range = (c_max - c_min) or 1.0
+
+        def _norm_cooc(v: float) -> float:
+            return _clamp((v - c_min) / c_range, 0.0, 1.0)
+
+        # Pesos del score final
+        W_COOC, W_GENRE, W_POP, W_REC = 0.50, 0.25, 0.15, 0.10
+
         scored: List[Tuple[float, Dict]] = []
-        for t in candidatos_tracks:
-            tid = t.get("id")
-            if not tid: continue
-            if vec_seed and tid in id2vec:
-                dist = _distancia_audio(vec_seed, id2vec[tid])
-            else:
-                # Fallback: priorizar popularidad (menor distancia = mejor)
-                dist = 9.99 - float(t.get("popularity", 0)) / 100.0
-            scored.append((dist, t))
-        scored.sort(key=lambda x: x[0])
+        years_seen: List[int] = []
+        for data in pool.values():
+            tr = data["track"]
+            if not tr or not tr.get("id"): continue
+            album = tr.get("album") or {}
+            year = _safe_year_from_release_date(album.get("release_date"))
+            if year: years_seen.append(year)
 
+        # para recency si no hay año de semilla, normalizamos por distribución del pool
+        y_min = min(years_seen) if years_seen else None
+        y_max = max(years_seen) if years_seen else None
+        y_span = (y_max - y_min) if (y_min is not None and y_max is not None) else None
+
+        def _recency_score(y: Optional[int]) -> float:
+            if y is None:
+                return 0.5
+            if seed_year:
+                return _clamp(1.0 - (abs(y - seed_year) / 10.0), 0.0, 1.0)
+            if y_span and y_span > 0:
+                return _clamp((y - y_min) / y_span, 0.0, 1.0)  # más nuevo → mejor
+            return 0.5
+
+        for tid, data in pool.items():
+            tr = data["track"]
+            main_artist = (tr.get("artists") or [{}])[0]
+            aid = main_artist.get("id")
+            aname = main_artist.get("name", "")
+            title = tr.get("name", "")
+            cleaned = clean_title(title, False).lower().strip()
+            if not cleaned:
+                continue
+            # señales
+            S_cooc = _norm_cooc(data["cooc"] + data["bonus"])
+            genres_cand = id2genres.get(aid, [])
+            S_genre = _jaccard(seed_genres, genres_cand)
+            S_pop = (tr.get("popularity", 0) or 0) / 100.0
+            year = _safe_year_from_release_date((tr.get("album") or {}).get("release_date"))
+            S_rec = _recency_score(year)
+
+            score = (W_COOC * S_cooc) + (W_GENRE * S_genre) + (W_POP * S_pop) + (W_REC * S_rec)
+            scored.append((score, tr))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
         muestra = ", ".join([f"{(s[1].get('name','?'))}:{s[0]:.2f}" for s in scored[:5]])
-        logging.debug(f"Radio Vecinos: 🧭 top5_distancias=[{muestra}] t={perf_counter()-t_rank:.3f}s")
+        logging.debug(f"Radio Cooc: 🧭 top5_scores=[{muestra}]")
 
+        # 6) Selección final y formateo
         elegidos: List[Tuple[str, str, str, str, Optional[str], Optional[str]]] = []
         vistos_batch: Set[str] = set()
-
-        for dist, t in scored:
+        for score, t in scored:
             if len(elegidos) >= devolver: break
             titulo = t.get("name", "")
             artista_nombre = (t.get("artists") or [{}])[0].get("name", "")
+            artista_id = (t.get("artists") or [{}])[0].get("id")
             cleaned = clean_title(titulo, False).lower().strip()
-            clave = re.sub(r'\s+', ' ', f"{artista_nombre.lower().strip()} {cleaned}")
+            clave = re.sub(r"\s+", " ", f"{artista_nombre.lower().strip()} {cleaned}")
             if cleaned and cleaned not in sesion_clean and clave not in vistos_batch:
                 vistos_batch.add(cleaned); vistos_batch.add(clave)
                 album = t.get("album") or {}
@@ -383,28 +430,28 @@ def _fetch_radio_vecinos_sync(
                 rd = album.get("release_date")
                 if isinstance(rd, str) and rd:
                     release_year = rd.split("-")[0]
-                artista_id = (t.get("artists") or [{}])[0].get("id")
                 track_id = t.get("id")
                 if all([artista_nombre, artista_id, titulo, track_id]):
                     elegidos.append((f"{artista_nombre} - {titulo}", artista_id, track_id, cleaned, image_url, release_year))
-                    logging.info(f"Radio Vecinos: ✅ elegido '{artista_nombre} - {titulo}' dist={dist:.3f}")
+                    logging.info(f"Radio Cooc: ✅ elegido '{artista_nombre} - {titulo}' score={score:.3f}")
 
         if elegidos:
-            logging.info(f"Radio Vecinos: 🏁 devolviendo {len(elegidos)} temas (vecinos) Ttotal={perf_counter()-t0:.3f}s")
+            logging.info(f"Radio Cooc: 🏁 devolviendo {len(elegidos)} temas Ttotal={perf_counter()-t0:.3f}s")
             return elegidos
 
-        logging.warning(f"Radio Vecinos: ❌ sin elegidos finales tras filtros Ttotal={perf_counter()-t0:.3f}s")
+        logging.warning(f"Radio Cooc: ❌ sin elegidos finales tras filtros Ttotal={perf_counter()-t0:.3f}s")
         return None
 
     except SpotifyException as exc:
-        logging.exception(f"Radio Vecinos: 💥 error API ({getattr(exc, 'http_status','?')}) Ttotal={perf_counter()-t0:.3f}s")
+        logging.exception(f"Radio Cooc: 💥 error API ({getattr(exc, 'http_status','?')}) Ttotal={perf_counter()-t0:.3f}s")
         return None
     except Exception:
-        logging.exception(f"Radio Vecinos: 💥 error inesperado Ttotal={perf_counter()-t0:.3f}s")
+        logging.exception(f"Radio Cooc: 💥 error inesperado Ttotal={perf_counter()-t0:.3f}s")
         return None
 
 # ==================================================
 # Fallback: LÓGICA DE RECOMENDACIÓN (AÑO + PLAYLIST)
+# (se mantiene, usa endpoints permitidos)
 # ==================================================
 def _fetch_recommendation_playlist_search_sync(
     original_title: str,
@@ -474,7 +521,7 @@ def _fetch_recommendation_playlist_search_sync(
         try:
             tracks_data = client.playlist_items(
                 playlist_id,
-                fields='items(track(id, name, artists(id, name), album(images,release_date)))',
+                fields='items(track(id, name, popularity, artists(id, name), album(images,release_date)))',
                 limit=50
             )
         except SpotifyException as e:
@@ -558,7 +605,7 @@ def _fetch_recommendation_playlist_search_sync(
         logging.exception(f"Radio Spotify: 💥 Error inesperado en fallback")
         return None
 
-# --- Wrapper async: intenta Vecinos primero y luego Fallback por Playlist ---
+# --- Wrapper async: intenta Co-ocurrencia+Feats primero y luego Fallback por Playlist ---
 async def fetch_spotify_recommendation(
     original_title: str,
     session_played_tuples: Set[Tuple[str, str]],
@@ -569,16 +616,16 @@ async def fetch_spotify_recommendation(
         return None
     loop = asyncio.get_event_loop()
     history_key = tuple(sorted(list(session_played_tuples)))
-    logging.info(f"Radio Engine: 🎚️ Estrategia=Vecinos→Fallback seed='{original_title}' historial={len(history_key)}")
+    logging.info(f"Radio Engine: 🎚️ Estrategia=Cooc+Feats→Fallback seed='{original_title}' historial={len(history_key)}")
     try:
-        # 1) Intento principal: Vecinos por artista + audio-features (tolerante a 403)
-        vecinos = await loop.run_in_executor(None, lambda: _fetch_radio_vecinos_sync(original_title, history_key))
+        # 1) Intento principal: Co-ocurrencia en playlists + colaboraciones
+        vecinos = await loop.run_in_executor(None, lambda: _fetch_radio_cooc_sync(original_title, history_key))
         if vecinos:
-            logging.info(f"Radio Engine: ✅ Vecinos produjo {len(vecinos)} temas")
+            logging.info(f"Radio Engine: ✅ Cooc+Feats produjo {len(vecinos)} temas")
             return vecinos
 
-        logging.info("Radio Engine: ↩️ Vecinos no produjo resultados, aplicando Fallback Playlist…")
-        # 2) Fallback: Playlist por año / base (tu lógica previa)
+        logging.info("Radio Engine: ↩️ Cooc+Feats no produjo resultados, aplicando Fallback Playlist…")
+        # 2) Fallback: Playlist por año / base
         fallback = await loop.run_in_executor(None, lambda: _fetch_recommendation_playlist_search_sync(original_title, history_key))
         if fallback:
             logging.info(f"Radio Engine: ✅ Fallback produjo {len(fallback)} temas")
@@ -589,7 +636,7 @@ async def fetch_spotify_recommendation(
         logging.exception("Radio Engine: 💥 Error en fetch_spotify_recommendation")
         return None
 
-# --- Función get_spotify_genres_for_track (sin cambios) ---
+# --- Función get_spotify_genres_for_track (sigue disponible, usa endpoints permitidos) ---
 async def get_spotify_genres_for_track(track_title: Optional[str]) -> Optional[List[str]]:
     if not track_title: return None
     client = _ensure_spotify_client()
