@@ -17,5 +17,4 @@ lxml==5.1.0
 
 # HTTP Client
 aiohttp==3.9.5
-audioop-lts
 flask
