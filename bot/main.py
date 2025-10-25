@@ -56,8 +56,9 @@ logging.getLogger('wavelink').setLevel(logging.INFO)
 settings = get_settings()
 
 # --- Configuración Lavalink ---
-LAVALINK_URI = os.getenv("LAVALINK_URI", "ws://localhost:2333")
-LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
+# Nodo de Brasil - TriniumHost (Lavalink v4.x)
+LAVALINK_URI = os.getenv("LAVALINK_URI", "wss://lavalink-v4.triniumhost.com:443")
+LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD", "free")
 
 if not settings.discord_token:
     logging.critical("❌ DISCORD_TOKEN no está definido.")
@@ -91,24 +92,24 @@ class MyBot(commands.Bot):
         logging.info(f"Prefijo: {settings.command_prefix}")
 
         if not wavelink.Pool.nodes and not self.wavelink_connected:
-            logging.info(f"Intentando conectar con Lavalink en {LAVALINK_URI}...")
+            logging.info(f"Intentando conectar con Lavalink (TriniumHost Brasil) en {LAVALINK_URI}...")
             try:
                 node = wavelink.Node(
-                    identifier="MAIN",
+                    identifier=f"{LAVALINK_URI}",
                     uri=LAVALINK_URI,
                     password=LAVALINK_PASSWORD
                 )
                 await wavelink.Pool.connect(nodes=[node], client=self, cache_capacity=100)
                 self.wavelink_connected = True
-                logging.info("✅ Wavelink conectado correctamente.")
+                logging.info("✅ Wavelink conectado correctamente a TriniumHost Brasil.")
             except Exception as e:
                 logging.error(f"❌ Error conectando con Lavalink ({type(e).__name__}): {e}")
                 if isinstance(e, (aiohttp.ClientConnectorError, asyncio.TimeoutError)):
-                    logging.warning("Verifica que Lavalink esté corriendo y accesible.")
+                    logging.warning("Verifica que el nodo de Lavalink esté accesible.")
                 elif "Authorization" in str(e) or "password" in str(e).lower():
-                    logging.warning("Error de contraseña o autorización con Lavalink.")
+                    logging.warning("Error de contraseña. Verifica que la password sea 'free'.")
                 else:
-                    logging.exception("Traceback del error no manejado:")
+                    logging.exception("Traceback del error:")
 
     @commands.Cog.listener()
     async def on_wavelink_node_ready(self, payload: wavelink.NodeReadyEventPayload) -> None:
